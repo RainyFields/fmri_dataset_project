@@ -8,7 +8,7 @@ from pathlib import Path
 import nibabel as nib
 
 # ==== Config ====
-subject = "sub-06"
+subject = "sub-01"
 region_level = True
 atlas_path = "/project/def-pbellec/xuan/fmri_dataset_project/data/Glasser_LR_Dense64k.dlabel.nii"
 
@@ -36,7 +36,7 @@ if region_level:
     n_regions = len(region_labels)
 
 # ==== Load Betas ====
-input_path = f"/project/def-pbellec/xuan/fmri_dataset_project/data/betas/grouped_betas/task_relevant_only/{subject}_task_condition_betas.pkl"
+input_path = f"/project/def-pbellec/xuan/fmri_dataset_project/data/trial_level_betas/grouped_betas/task_relevant_only/{subject}_task_condition_betas.pkl"
 with open(input_path, "rb") as f:
     condition_betas = pickle.load(f)
 

@@ -17,6 +17,10 @@
 
 import pandas as pd
 from pathlib import Path
+MAP = {"x": True,
+        "b": False,
+        None: None,
+        "--": None,}
 
 def reformat_ctxdm_behavior(df, tr=1.49):
     """
@@ -64,7 +68,7 @@ def reformat_ctxdm_behavior(df, tr=1.49):
             if stim_order < 3:
                 is_correct = None
             else:
-                is_correct = row.get('action') == row.get('response_2', None)
+                is_correct = row.get('action') == MAP[row.get('response_2', None)]
 
             output_rows.append({
                 'trialNumber': trial_number,
@@ -129,7 +133,7 @@ def reformat_interdms_behavior(df, tr=1.49):
                 is_correct = None
             else:
                 response_index = stim_order - 1  # response_2 for stim 3, response_3 for stim 4
-                is_correct = row.get(f'action{stim_order-2}') == row.get(f'response_{response_index}', None)
+                is_correct = row.get(f'action{stim_order-2}') == MAP[row.get(f'response_{response_index}', None)]
 
             output_rows.append({
                 'trialNumber': trial_number,
@@ -193,7 +197,9 @@ def reformat_1back_behavior(df, tr=1.49):
             if i == 0:
                 is_correct = None  # no previous response to compare to
             else:
-                is_correct = row[f'action{i+1}'] == row.get(f'response_{i}', None)
+                # print(f"row response: {row.get(f'response_{i}')}, action: {row[f'action{i+1}']}")
+                is_correct = row[f'action{i+1}'] == MAP[row.get(f'response_{i}', None)]
+                # print(f"inspection of delay frame {i}: action{i+1}={row[f'action{i+1}']}, response_{i}={MAP[row.get(f'response_{i}', None)]}, is_correct={is_correct}")
                 assert is_correct is not None, f"response_{i} column is required for correctness check"
             
             output_rows.append({
@@ -219,7 +225,7 @@ subjects = ['01', '02', '03', '05', '06']
 
 sessions = [f"{i:03}" for i in range(1, 17)]
 
-task_name = "ctxdm"
+task_name = "ctxdm"  # change to "interdms" or "ctxdm" as needed
 for sub in subjects:
     for ses in sessions:
         func_dir = root_path / f"sub-{sub}" / f"ses-{ses}" / "func"

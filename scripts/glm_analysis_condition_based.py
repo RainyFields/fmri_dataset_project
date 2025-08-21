@@ -1,37 +1,31 @@
 #!/usr/bin/env python3
 """
-Per-run **trial-level** GLM with cosine drifts + AR(1), HRF-convolved *one regressor per event row*.
-Saves the **FULL design matrix** + names so you can do contrasts and design visualization later.
+Per-run GLM (condition-level) with cosine drifts + AR(1), with separate
+'encoding' and 'delay' regressors (HRF-convolved). Also saves the FULL design
+matrix (both to HDF5 and CSV).
 
 Outputs per run (under out_root/.../sub-XX/ses-YY/func/):
   - <base>_betas.h5
       datasets:
-        betas                 (P x K_task)     # trial-wise betas, in the same order as task_regressor_names
-        XtX_inv               (K x K)          # for full X
-        sigma2                (P,)             # residual variance per parcel
-        residuals_shape       (2,)             # (T_kept, P)
-        all_regressors_shape  (2,)             # (T_kept, K)
-        design_matrix         (T_kept x K)     # FULL X = [confounds, drifts+intercept, task(trials)]
-        design_col_names      (K,)             # HDF5 string dtype
+        betas                 (P x 2)          # columns: ["encoding", "delay"]
+        XtX_inv               (K x K)
+        sigma2                (P,)
+        residuals_shape       (2,)              # (T_kept, P)
+        all_regressors_shape  (2,)              # (T_kept, K)
+        design_matrix         (T_kept x K)      # FULL X
+        design_col_names      (K,)  (HDF5 string dtype)
       attrs:
-        task_regressor_names  [list of trial column names]
-        regressor_level       "trial"
-        task_col_start, task_col_end (int)     # inclusive-exclusive slice in X for task columns
+        task_regressor_names ["encoding", "delay"]
+        regressor_level      "condition"
+        task_col_start, task_col_end (int)  # inclusive-exclusive
         dof, rho_ar1, tmask_dropped, high_pass_sec
-        order_in_X            "[confounds, drifts+intercept, task(trials)]"
-  - <base>_design.csv            # per-trial metadata (trialNumber, type, etc.) in the same column order as betas
+        order_in_X           "[confounds, drifts+intercept, task(encoding,delay)]"
+  - <base>_design.csv            # minimal condition list: ["encoding","delay"]
   - <base>_design_matrix.csv     # human-friendly CSV of FULL design matrix
-
-Example
--------
-python glm_analysis.py \
-  --subj sub-01 \
-  --tasks ctxdm  \
-  --include_types encoding delay \
-  --out_root /project/def-pbellec/xuan/fmri_dataset_project/data \
-  --overwrite
 """
+
 from __future__ import annotations
+import os
 import re
 import h5py
 from pathlib import Path
@@ -45,18 +39,20 @@ from nilearn.glm.first_level import spm_hrf, make_first_level_design_matrix
 
 from utils import glm_confounds_construction, standardize_run_label
 
+
 # -----------------------
 # CLI / hyperparams
 # -----------------------
 
 def get_args():
-    p = argparse.ArgumentParser(description="Per-run trial-level GLM with cosine drifts + AR(1), HRF-convolved.")
-    p.add_argument("--subj", default="sub-01")
+    p = argparse.ArgumentParser(
+        description="Per-run GLM with cosine drifts + AR(1), separate encoding and delay regressors."
+    )
+    p.add_argument("--subj", default="sub-03")
     p.add_argument("--tr", type=float, default=1.49)
     p.add_argument("--tmask", type=int, default=1, help="Frames to drop at run start")
     p.add_argument("--correct_only", action="store_true", help="Use only correct trials")
-    p.add_argument("--tasks", nargs="+", default=["ctxdm"], help="Task names to process")
-    p.add_argument("--include_types", nargs="+", default=["encoding","delay"], help="Event types to include as trial regressors (lowercased)")
+    p.add_argument("--tasks", nargs="+", default=["ctxdm", "interdms", "1back"])
     p.add_argument("--fmri_root", default="/project/def-pbellec/xuan/fmri_dataset_project/data/glasser_resampled")
     p.add_argument("--conf_root", default="/project/def-pbellec/xuan/cneuromod.multfs.fmriprep")
     p.add_argument("--events_root", default="/project/def-pbellec/xuan/fmri_dataset_project/data/reformated_behavior")
@@ -65,12 +61,13 @@ def get_args():
     p.add_argument("--overwrite", action="store_true")
     return p.parse_args()
 
+
 # -----------------------
 # Utilities
 # -----------------------
 
 def default_output_root(out_root_base: Path, correct_only: bool, subj: str) -> Path:
-    return (out_root_base / ("correct_trial_level_betas" if correct_only else "trial_level_betas") / subj)
+    return (out_root_base / ("correct_condition_level_betas" if correct_only else "condition_level_betas") / subj)
 
 
 def discover_sessions(fmri_root_dir: Path):
@@ -102,127 +99,74 @@ def clean_events(df_events: pd.DataFrame) -> pd.DataFrame:
 
 
 # -----------------------
-# Regressor builders (trial-wise)
+# Regressor builders (encoding & delay)
 # -----------------------
 
-def build_trialwise_regressors(
-    df_events: pd.DataFrame,
-    num_trs: int,
-    tr: float,
-    include_types: list[str],
-    correct_only: bool = False,
-):
+def _build_binary_regressor(df_events: pd.DataFrame, num_trs: int, tr: float, event_type: str):
     """
-    Build one HRF-convolved regressor per *event row* whose `type` is in include_types.
+    Build a TR-binned 0/1 boxcar regressor for a given event 'type'.
 
-    If `correct_only` is True and `is_correct` exists, EXCLUDE rows where is_correct is:
-      - False (boolean)
-      - 'false' (any case)
-      - 'b' (any case)
-    All other values are accepted (including NaN).
-
-    TR-binned boxcar:
-      onset_tr = floor(onset_time / TR)
+    Rules (per your spec):
+      onset_tr  = ceil(onset_time / TR)
       offset_tr = floor(offset_time / TR)
-      add 1.0 on [onset_tr, offset_tr) clipped to [0, T)
+      include interval [onset_tr, offset_tr) only if onset_tr < offset_tr.
     """
-    req_cols = {"onset_time", "offset_time", "type"}
-    if not req_cols.issubset(df_events.columns):
-        missing = ", ".join(sorted(req_cols - set(df_events.columns)))
-        raise ValueError(f"Events missing required columns: {missing}")
+    if "type" not in df_events.columns:
+        raise ValueError("Events missing required 'type' column.")
+    if not {"onset_time", "offset_time"}.issubset(df_events.columns):
+        raise ValueError("Events must include 'onset_time' and 'offset_time' columns (in seconds).")
 
-    # Type filtering
-    types = df_events["type"].astype(str).str.strip().str.lower()
-    mask_type = types.isin([t.lower() for t in include_types])
+    typ = df_events["type"].astype(str).str.strip().str.lower()
+    df_sel = df_events[typ == event_type].copy()
 
-    # Correct-only filtering per your rule
-    if correct_only and "is_correct" in df_events.columns:
-        def is_negative(v):
-            # exclude only False / 'false' / 'b'
-            if isinstance(v, (bool, np.bool_)):
-                return (v is False) or (v == False)
-            if pd.isna(v):
-                return False  # NaN is acceptable
-            sv = str(v).strip().lower()
-            return sv in {"false", "b"}
-
-        mask_correct = ~df_events["is_correct"].apply(is_negative)
-        mask = mask_type & mask_correct
-    else:
-        mask = mask_type
-
-    df_sel = df_events.loc[mask].reset_index(drop=True)
-
-    T = num_trs
-    box = []
-    names = []
-    meta_rows = []
-
-    # Safe getter
-    def g(row: pd.Series, key, default=np.nan):
-        return row[key] if (key in row.index and pd.notna(row[key])) else default
-
-    for i, row in df_sel.iterrows():
-        on = float(row["onset_time"]) if pd.notna(row["onset_time"]) else np.nan
-        off = float(row["offset_time"]) if pd.notna(row["offset_time"]) else np.nan
+    r = np.zeros((num_trs, 1), dtype=np.float32)
+    for _, row in df_sel.iterrows():
+        on = float(row["onset_time"])
+        off = float(row["offset_time"])
         if not np.isfinite(on) or not np.isfinite(off):
             continue
 
-        a = int(np.floor(on / tr))
-        b = int(np.floor(off / tr))
-        a = max(0, min(a, T))
-        b = max(0, min(b, T))
+        onset_tr = int(np.floor(on / tr))
+        offset_tr = int(np.floor(off / tr))
 
-        vec = np.zeros((T,), dtype=np.float32)
-        if b > a:
-            vec[a:b] = 1.0
-            box.append(vec)
-        else:
-            continue  # skip zero-length after binning
+        # clip to bounds
+        a = max(0, min(onset_tr, num_trs))
+        b = max(0, min(offset_tr, num_trs))
+        if a < b:
+            r[a:b, 0] += 1.0
 
-        tn = g(row, "trialNumber", i)
-        typ = str(row["type"]).strip().lower()
-        try:
-            names.append(f"trial{int(tn):03d}_{typ}")
-        except Exception:
-            names.append(f"trial{i:03d}_{typ}")
+    count_ones = int(r[:, 0].sum())
+    ratio = count_ones / num_trs if num_trs > 0 else 0.0
+    print(f"[{event_type.capitalize()} regressor] 1s: {count_ones}/{num_trs}  (ratio={ratio:.4f})")
+    return r
 
-        # Keep original is_correct value (no coercion) for bookkeeping
-        meta_rows.append({
-            "trial_index": len(names) - 1,
-            "trialNumber": tn,
-            "type": typ,
-            "onset_time": on,
-            "offset_time": off,
-            "is_correct": g(row, "is_correct"),
-            "stim_order": g(row, "stim_order"),
-            "location": g(row, "locmod"),
-            "category": g(row, "ctgmod"),
-            "object": g(row, "objmod"),
-        })
 
-    if len(box) == 0:
-        empty_cols = ["trial_index","trialNumber","type","onset_time","offset_time","is_correct","stim_order","location","category","object"]
-        return np.zeros((T, 0), dtype=np.float32), [], pd.DataFrame(columns=empty_cols)
-
-    R_box = np.stack(box, axis=1)  # (T x K)
-
-    # Convolve with canonical SPM HRF
+def _convolve_hrf(boxcar: np.ndarray, tr: float) -> np.ndarray:
+    """Convolve TR-binned boxcar with SPM canonical HRF."""
+    T = boxcar.shape[0]
     h = spm_hrf(tr, oversampling=1)
-    R_hrf = np.zeros_like(R_box, dtype=np.float32)
-    for k in range(R_box.shape[1]):
-        tmp = np.convolve(R_box[:, k], h)
-        R_hrf[:, k] = tmp[:T]
+    out = np.zeros_like(boxcar, dtype=np.float32)
+    tmp = np.convolve(boxcar[:, 0], h)
+    out[:T, 0] = tmp[:T]
+    return out
 
-    trial_info = pd.DataFrame(meta_rows).sort_values(by="trial_index").reset_index(drop=True)
-    return R_hrf, names, trial_info
+
+def build_encoding_regressor(df_events: pd.DataFrame, num_trs: int, tr: float) -> tuple[np.ndarray, list[str]]:
+    box = _build_binary_regressor(df_events, num_trs, tr, event_type="encoding")
+    return _convolve_hrf(box, tr), ["encoding"]
+
+
+def build_delay_regressor(df_events: pd.DataFrame, num_trs: int, tr: float) -> tuple[np.ndarray, list[str]]:
+    box = _build_binary_regressor(df_events, num_trs, tr, event_type="delay")
+    return _convolve_hrf(box, tr), ["delay"]
 
 
 # -----------------------
 # Drifts + intercept (nilearn-style cosine)
 # -----------------------
 
-def per_run_drift_and_intercept(num_trs: int, tr: float, high_pass_sec: float = 128.0):
+def per_run_drift_and_intercept(num_trs: int, tr: float, high_pass_sec: float = 128.0) -> tuple[np.ndarray, list[str]]:
+    """Intercept + cosine drifts like nilearn (T x D), and their column names."""
     frame_times = np.arange(num_trs) * tr
     dm = make_first_level_design_matrix(
         frame_times,
@@ -243,6 +187,10 @@ def per_run_drift_and_intercept(num_trs: int, tr: float, high_pass_sec: float = 
 # -----------------------
 
 def estimate_rho_from_resid(resid_run: np.ndarray) -> float:
+    """
+    Estimate AR(1) rho from run residuals (T x P) using shared rho.
+    ε_t = ρ ε_{t-1} + u_t; clip rho to [-0.99, 0.99].
+    """
     e = resid_run - resid_run.mean(axis=0, keepdims=True)
     num = float(np.sum(e[1:] * e[:-1]))
     den = float(np.sum(e[:-1] * e[:-1]) + 1e-12)
@@ -250,14 +198,23 @@ def estimate_rho_from_resid(resid_run: np.ndarray) -> float:
     return float(np.clip(rho, -0.99, 0.99))
 
 
-def whiten_ar1(X: np.ndarray, Y: np.ndarray, rho: float):
-    Xw = X.copy(); Yw = Y.copy()
+def whiten_ar1(X: np.ndarray, Y: np.ndarray, rho: float) -> tuple[np.ndarray, np.ndarray]:
+    """Apply AR(1) whitening to design X and data Y (row-wise)."""
+    Xw = X.copy()
+    Yw = Y.copy()
     Xw[1:] -= rho * Xw[:-1]
     Yw[1:] -= rho * Yw[:-1]
     return Xw, Yw
 
 
-def fit_glm_with_ar1(X: np.ndarray, Y: np.ndarray):
+def fit_glm_with_ar1(X: np.ndarray, Y: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, np.ndarray]:
+    """
+    Two-pass fit:
+      1) quick OLS → residuals → estimate rho
+      2) whiten X,Y with rho → final OLS
+    Returns:
+      betas_full (P x K), XtX_inv (K x K), sigma2 (P,), dof (int), residuals (T x P)
+    """
     # Pass 1: quick OLS
     reg0 = LinearRegression().fit(X, Y)
     resid0 = Y - reg0.predict(X)
@@ -274,9 +231,9 @@ def fit_glm_with_ar1(X: np.ndarray, Y: np.ndarray):
 
     dof = Xw.shape[0] - np.linalg.matrix_rank(Xw)
     dof = int(max(dof, 1))
-    sigma2 = (resid**2).sum(axis=0) / dof
+    sigma2 = (resid**2).sum(axis=0) / dof   # per parcel
 
-    betas_full = B.T              # (P x K)
+    betas_full = B.T                        # (P x K)
     return betas_full, XtX_inv, sigma2, dof, resid
 
 
@@ -288,10 +245,9 @@ def main():
     args = get_args()
 
     subj = args.subj
-    tr = args.tr
+    tr_length = args.tr
     tmask = args.tmask
     correct_only = args.correct_only
-    include_types = [t.lower() for t in args.include_types]
 
     fmri_root_dir = Path(args.fmri_root) / subj
     confounds_root_dir = Path(args.conf_root) / subj
@@ -303,15 +259,16 @@ def main():
 
     for task_name in args.tasks:
         for ses in sessions:
+            # find runs
             runs = discover_runs_for_task_session(subj, ses, task_name, fmri_root_dir)
             print(f"[{task_name} | {ses}] runs: {runs}")
 
             for run in runs:
                 # Paths
                 behavioral_file = events_root_dir / ses / "func" / f"{subj}_{ses}_task-{task_name}_{standardize_run_label(run)}_events.tsv"
-                
-                if not behavioral_file.exists():
-                    print(f"⚠️ Behavioral file {behavioral_file} does not exist, skipping.")
+                behavioral_path = behavioral_file
+                if not behavioral_path.exists():
+                    print(f"⚠️ Behavioral file {behavioral_path} does not exist, skipping.")
                     continue
 
                 timeseries_file = fmri_root_dir / ses / f"{subj}_{ses}_task-{task_name}_{run}_space-Glasser64k_bold.dtseries.nii"
@@ -321,13 +278,13 @@ def main():
                     print(f"⚠️ Missing data for {ses} {run} {task_name}, skipping.")
                     continue
 
-                # Output paths
-                rel_behavioral_path = behavioral_file.relative_to(events_root_dir)
+                # Output
+                rel_behavioral_path = behavioral_path.relative_to(events_root_dir)
                 target_subdir = output_dir / rel_behavioral_path.parent
-                base_name = behavioral_file.stem.replace("_events", "")
+                base_name = behavioral_path.stem.replace("_events", "")  # e.g., sub-01_ses-003_task-1back_run-01
                 h5_file = target_subdir / f"{base_name}_betas.h5"
-                design_csv = target_subdir / f"{base_name}_design.csv"
-                design_matrix_csv = target_subdir / f"{base_name}_design_matrix.csv"
+                design_csv = target_subdir / f"{base_name}_design.csv"              # minimal list
+                design_matrix_csv = target_subdir / f"{base_name}_design_matrix.csv" # FULL X
 
                 if h5_file.exists() and not args.overwrite:
                     print(f"[⏩] Skipping {h5_file} — already exists.")
@@ -346,102 +303,85 @@ def main():
                     C = np.nan_to_num(C_mat, nan=0.0).astype(np.float32)
                     conf_names = [f"conf_{i}" for i in range(C.shape[1])]
 
-                df_events = pd.read_csv(behavioral_file, sep="\t")
-                # print(f"inspection of the length of behavioral_file: {len(df_events)}")
+                df_events = pd.read_csv(behavioral_path, sep="\t")
                 df_events = clean_events(df_events)
                 if correct_only and "is_correct" in df_events.columns:
-                    df_events = df_events[~df_events["is_correct"].apply(
-                        lambda v: (isinstance(v, (bool, np.bool_)) and v is False) or
-                                (isinstance(v, str) and v.strip().lower() in {"false", "b"})
-                    )]
-
-                # print(f"inspection of the length of df_events after filtering: {len(df_events)}")
+                    df_events = df_events[df_events["is_correct"] == True]
 
                 T = Y.shape[0]
-                # print(f"shape of timeseries data: {Y.shape} (T x P)")
-                
+                print(f"shape of timeseries data: {Y.shape} (T x P)")
 
-                # ------------- Build task regressors (trial-wise) -------------
-                R_task, trial_names, trial_info = build_trialwise_regressors(df_events, T, tr, include_types, correct_only=correct_only)
-                # print(f"shape of trial_info: {len(trial_info)} (K x ?)")
-                if R_task.shape[1] == 0:
-                    print(f"⚠️ No trials of types {include_types} in {behavioral_file}, skipping.")
-                    continue
+                # ------------- Build task regressors -------------
+                R_enc, enc_names = build_encoding_regressor(df_events, T, tr_length)
+                R_dly, dly_names = build_delay_regressor(df_events, T, tr_length)
+                R_task = np.hstack([R_enc, R_dly])   # (T x 2)
+                task_names = enc_names + dly_names
 
                 # ------------- Drifts + intercept -------------
-                D, drift_names = per_run_drift_and_intercept(T, tr, high_pass_sec=args.high_pass_sec)
+                D, drift_names = per_run_drift_and_intercept(T, tr_length, high_pass_sec=args.high_pass_sec)
 
                 # tmask skip (apply to all time-dependent arrays)
                 keep = np.ones((T,), dtype=bool)
                 keep[:tmask] = False
-                # print(f"shape of Y before tmask: {Y.shape}")
                 Y = Y[keep, :]
-                # print(f"shape of Y after tmask: {Y.shape}")
                 C = C[keep, :]
-                # print(f"shape of R_task before tmask: {R_task.shape}")
                 R_task = R_task[keep, :]
-                # print(f"shape of R_task after tmask: {R_task.shape}")
                 D = D[keep, :]
-                # print(f"shape of D after tmask: {D.shape}")
 
                 # ------------- Assemble X -------------
+                # Order: [confounds, drifts+intercept, task(encoding, delay)]
                 X = np.hstack([C, D, R_task]).astype(np.float32)
                 Yf = Y.astype(np.float32)
-                design_col_names = conf_names + drift_names + list(trial_names)
 
-
+                # Names matching the columns of X
+                design_col_names = conf_names + drift_names + list(task_names)
 
                 # ------------- Fit GLM with AR(1) -------------
                 betas_full, XtX_inv, sigma2, dof, resid = fit_glm_with_ar1(X, Yf)
-                print(f"shape of design matrix X: {X.shape} (T_kept x K)")
-                print(f"shape of betas_full: {betas_full.shape} (P x K_task)")
-                print(f"shape of timeseries data Yf: {Yf.shape} (T_kept x P)")
 
                 # Indices for task columns (last K_task)
-                K_task = R_task.shape[1]
-                betas_task = betas_full[:, -K_task:]
-                print(f"shape of betas_task : {betas_task.shape} (P x K_task)")
+                K_task = R_task.shape[1]            # should be 2
+                betas_task = betas_full[:, -K_task:]  # (P x 2)
                 task_col_start = X.shape[1] - K_task
                 task_col_end = X.shape[1]
 
                 # ------------- Save outputs -------------
                 target_subdir.mkdir(parents=True, exist_ok=True)
 
-                # Per-trial metadata CSV in task order
-                # Ensure trial_info matches trial_names order
-                trial_info_sorted = trial_info.sort_values(by='trial_index')
-                trial_info_sorted.to_csv(design_csv, index=False)
+                # Minimal condition design CSV (so contrasts know column order)
+                pd.DataFrame({"condition": task_names}).to_csv(design_csv, index=False)  # ["encoding","delay"]
 
-                # Full design matrix CSV
+                # Human-friendly full design matrix CSV
                 pd.DataFrame(X, columns=design_col_names).to_csv(design_matrix_csv, index=False)
 
-                # HDF5
                 with h5py.File(h5_file, "w") as h5f:
                     # Core outputs
-                    h5f.create_dataset("betas", data=betas_task.astype(np.float32))        # (P x K_task)
+                    h5f.create_dataset("betas", data=betas_task.astype(np.float32))        # (P x 2): encoding, delay
                     h5f.create_dataset("all_regressors_shape", data=np.array(X.shape, dtype=np.int32))
-                    # Stats
-                    h5f.create_dataset("XtX_inv", data=XtX_inv.astype(np.float32))          # (K x K)
+                    # Stats for t/z
+                    h5f.create_dataset("XtX_inv", data=XtX_inv.astype(np.float32))          # (K x K), K = X.shape[1]
                     h5f.create_dataset("sigma2", data=sigma2.astype(np.float32))            # (P,)
                     h5f.create_dataset("residuals_shape", data=np.array(resid.shape, dtype=np.int32))
-                    # Full design matrix + names
+
+                    # --- Full design matrix + names ---
                     h5f.create_dataset("design_matrix", data=X.astype(np.float32))          # (T_kept x K)
                     str_dtype = h5py.string_dtype(encoding="utf-8")
                     h5f.create_dataset("design_col_names", data=np.array(design_col_names, dtype=object), dtype=str_dtype)
 
                     # Metadata
-                    h5f.attrs.create("task_regressor_names", np.array(trial_names, dtype=str_dtype), dtype=str_dtype)
-                    h5f.attrs["regressor_level"] = "trial"
+                    h5f.attrs.create("task_regressor_names", np.array(task_names, dtype=str_dtype), dtype=str_dtype)  # ["encoding","delay"]
+                    h5f.attrs["regressor_level"] = "condition"
                     h5f.attrs["task_col_start"] = task_col_start
                     h5f.attrs["task_col_end"] = task_col_end
                     h5f.attrs["dof"] = dof
+                    # rho of whitened resid should be ~0; store estimate from whitened residuals for reference
                     h5f.attrs["rho_ar1"] = float(estimate_rho_from_resid(resid))
                     h5f.attrs["tmask_dropped"] = tmask
                     h5f.attrs["high_pass_sec"] = args.high_pass_sec
-                    h5f.attrs["order_in_X"] = "[confounds, drifts+intercept, task(trials)]"
+                    h5f.attrs["order_in_X"] = "[confounds, drifts+intercept, task(encoding,delay)]"
 
                 print(f"[🎯] Saved betas + full design to {h5_file}")
-                print(f"[🧾] Trial design CSV: {design_csv}")
+                print(f"[🧾] Design (conditions): {design_csv}")
                 print(f"[📐] Full design matrix CSV: {design_matrix_csv}")
 
     print("[✅] Done.")

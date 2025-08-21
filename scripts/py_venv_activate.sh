@@ -10,7 +10,7 @@ salloc --account=def-bashivan --gres=gpu:1 --cpus-per-task=4 --mem=16G --time=4:
 module load python/3.10
 module load scipy-stack
 # activate teh environment
-source nilearn/bin/activate
+source /project/def-pbellec/xuan/nilearn/bin/activate
 
 
 pip install --no-index --upgrade pip
